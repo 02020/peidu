@@ -1,0 +1,290 @@
+/* 陪读桌面版 - CSS tokens
+   主题三态：light / sepia / dark
+   字号体系：--read-fs 为单位基准，所有相对字号基于此
+*/
+
+:root {
+  /* T1: 阅读字号 — 跟视口走, 最小 22px, 4K 满 */
+  --read-fs: clamp(22px, 1.8vmin, 40px);
+  --line-h: 1.7;
+}
+
+/* T1: 竖屏 — 跟视口宽度走 (web 版 2.6vw) */
+@media (orientation: portrait) {
+  :root {
+    --read-fs: clamp(22px, 2.6vw, 48px);
+  }
+}
+
+  /* T1: 列表项字号 14~32px 区间 */
+  --list-fs-min: 14px;
+  --list-fs-max: 32px;
+  --list-fs: clamp(14px, var(--read-fs), 32px);
+
+  /* 间距 */
+  --read-gap: 1.5em;
+
+  /* 浅色主题（默认）*/
+  --bg: #fafaf7;
+  --fg: #2a2a28;
+  --dim: #6a6a66;
+  --acc: #3a6ea5;
+  --hl: rgba(255, 220, 100, 0.4);
+  --border: #e6e3da;
+
+  /* 字体 — 默认霞鹜文楷; 由 [data-font] 覆盖 */
+  --read-font: '霞鹜文楷', 'LXGW WenKai', '思源宋体', 'Source Han Serif', '宋体', serif;
+  --mono-font: 'Cascadia Code', 'Consolas', monospace;
+}
+
+/* Q4: 字体族切换 */
+:root[data-font='lxgw'] {
+  --read-font: '霞鹜文楷', 'LXGW WenKai', serif;
+}
+:root[data-font='songti'] {
+  --read-font: '思源宋体', 'Source Han Serif', '宋体', 'Songti SC', serif;
+}
+:root[data-font='system'] {
+  --read-font: 'Georgia', 'Songti SC', 'Noto Serif CJK SC', serif;
+}
+
+/* P1: 字号固定, 不随屏幕/方向适配 */
+
+[data-theme='sepia'] {
+  --bg: #f4ecd8;
+  --fg: #5b4636;
+  --dim: #8a7560;
+  --acc: #a87c4f;
+  --hl: rgba(220, 180, 100, 0.45);
+  --border: #d9cdb1;
+}
+
+[data-theme='dark'] {
+  --bg: #1a1a1a;
+  --fg: #d0d0d0;
+  --dim: #888;
+  --acc: #6ba3d6;
+  --hl: rgba(180, 140, 60, 0.35);
+  --border: #333;
+}
+
+/* B8: 拆 :root font-size (rem 基准, 固定 16px) 与 --read-fs (阅读字号, 跟视口走) */
+:root {
+  font-size: 16px;  /* rem 永远 16px, 不被 --read-fs 影响 */
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html, body {
+  margin: 0;
+  padding: 0;
+  background: var(--bg);
+  color: var(--fg);
+  font-family: var(--read-font);
+  font-size: var(--read-fs);  /* 阅读字号: vmin 自适应 */
+  line-height: var(--line-h);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  overflow: hidden;
+  height: 100vh;
+}
+
+#app {
+  height: 100vh;
+  display: flex;
+  flex-direction: column;
+}
+
+/* T1: 全屏 .big 模式 — 字号跟视口走, 最小 36 */
+:where(:root.big) {
+  --read-fs: clamp(36px, 1.8vmin, 56px);
+  --line-h: 1.85;
+  --read-gap: 1.8em;
+}
+@media (orientation: portrait) {
+  :where(:root.big) {
+    --read-fs: clamp(36px, 2.6vw, 64px);
+  }
+}
+
+/* 滚动条 */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: var(--border);
+  border-radius: 3px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: var(--dim);
+}
+
+/* T1: 划线高亮 — 微信读书风格: 文字下方波浪线 + 浅淡底色 */
+.hl-match {
+  background: var(--hl);
+  border-radius: 2px;
+}
+
+.hl-pinned {
+  background: rgba(255, 165, 0, 0.3);
+  border-bottom: 1px solid rgba(255, 140, 0, 0.6);
+}
+
+.hl-orphan {
+  background: rgba(120, 120, 120, 0.2);
+  text-decoration: line-through;
+  text-decoration-color: var(--dim);
+}
+
+/* T1: pd-hl — 选中文本精确包裹的 <u> 样式 (不动 padding/margin — 保护 fitSeg) */
+.pd-hl {
+  background: rgba(255, 220, 100, 0.45);   /* 浅黄底色 */
+  text-decoration: underline;
+  text-decoration-color: rgba(180, 140, 60, 0.9);
+  text-decoration-style: wavy;
+  text-decoration-thickness: 1px;
+  text-underline-offset: 3px;
+  border-radius: 2px;
+  /* 关键: 不加 padding/margin/border, 段高不变 — fitSeg 安全 */
+}
+[data-theme='dark'] .pd-hl {
+  background: rgba(255, 215, 100, 0.32);  /* dark 模式加深底色 — 浅灰底配黄底显眼 */
+  text-decoration-color: rgba(255, 200, 80, 0.95);
+  text-decoration-thickness: 1.5px;
+  color: #fef9c3;                            /* 浅黄文字 — 对深底 */
+}
+[data-theme='sepia'] .pd-hl {
+  background: rgba(220, 180, 100, 0.35);
+  text-decoration-color: rgba(140, 100, 40, 0.95);
+}
+
+/* 段块 */
+.seg {
+  margin-bottom: var(--read-gap);
+}
+
+/* T1: 列表项字号区间 14~32px */
+.toc-item {
+  font-size: var(--list-fs);
+}
+
+/* D: 一段一屏, 按内容切割, 字号固定, 短段上下空白允许 */
+.seg-single {
+  width: 100%;
+  max-width: 100%;
+  min-height: 100%;  /* 短段不满时, 仍占满, 内容顶部对齐 */
+  line-height: var(--line-h);
+  /* font-size 由 inline style 实时控制 (currentFs = base, 固定) */
+  overflow-wrap: normal;
+  word-break: normal;
+}
+.seg-single > :first-child {
+  margin-top: 0;
+}
+.seg-single > :last-child {
+  margin-bottom: 0;
+}
+
+/* T1: 按钮弱化 / 固定大小 — 默认透明度, hover/focus 时变亮 */
+.btn,
+.btn-soft,
+.pd-icon {
+  opacity: 0.6;
+}
+.btn:hover,
+.btn:focus,
+.btn:active,
+.btn-soft:hover,
+.btn-soft:focus,
+.btn-soft:active,
+.pd-icon:hover,
+.pd-icon:focus,
+.pd-icon:active {
+  opacity: 1;
+}
+/* 主操作按钮保持饱满 */
+.btn-primary {
+  opacity: 1;
+}
+.btn-primary:hover,
+.btn-primary:focus {
+  opacity: 0.92;
+}
+
+/* T1: 深色主题 — 浅色文字 + 深底, 0.6 透明度过低看不见 */
+[data-theme='dark'] .btn,
+[data-theme='dark'] .btn-soft,
+[data-theme='dark'] .pd-icon {
+  opacity: 0.85;          /* dark 下默认更高透明度 */
+}
+[data-theme='dark'] .btn-primary {
+  opacity: 1;
+}
+
+/* T1: sepia 主题 — 文字深底浅, 0.6 OK 但 dim 文字需要提亮 */
+[data-theme='sepia'] .btn,
+[data-theme='sepia'] .btn-soft,
+[data-theme='sepia'] .pd-icon {
+  opacity: 0.75;
+}
+
+/* T1: 帮助模态里的 kbd 标签不要被 opacity 影响 */
+.modal-card .btn,
+.modal-card .btn-soft,
+.modal-card .pd-icon {
+  opacity: 1;
+}
+
+/* T1: dark 主题的 modal-card 背景 — 避免与 backdrop 融在一起 */
+[data-theme='dark'] .modal-card {
+  background: #242424;
+  border-color: #404040;
+}
+
+/* T1: dark 主题下输入框、按钮底色区分 */
+[data-theme='dark'] textarea,
+[data-theme='dark'] input[type="text"] {
+  background: #2a2a2a;
+  color: var(--fg);
+  border-color: #404040;
+}
+[data-theme='dark'] .bg-pd-bg {
+  background: #242424;
+}
+[data-theme='dark'] .bg-pd-border\/10,
+[data-theme='dark'] .bg-pd-border\/40 {
+  background-color: rgba(64, 64, 64, 0.4);
+}
+
+/* D2 划线粉色高亮 */
+.hl-pink {
+  background: rgba(255, 220, 240, 0.6);
+  border-radius: 3px;
+  padding: 0 2px;
+  cursor: text;
+}
+[data-theme='dark'] .hl-pink {
+  background: rgba(255, 200, 230, 0.18);
+}
+[data-theme='sepia'] .hl-pink {
+  background: rgba(255, 200, 180, 0.35);
+}
+
+/* 帮助模态 */
+kbd {
+  display: inline-block;
+  padding: 1px 6px;
+  border: 1px solid var(--border);
+  border-bottom-width: 2px;
+  border-radius: 3px;
+  font-family: var(--mono-font);
+  font-size: 0.85em;
+  background: var(--bg);
+  color: var(--fg);
+}

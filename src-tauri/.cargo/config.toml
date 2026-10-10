@@ -1,0 +1,11 @@
+# 强制 cargo 走 msvc toolchain + msvc target
+#  - rustc 直接指向 msvc toolchain 的 rustc.exe（绕开 rustup 1.29 解析 bug）
+#  - target = msvc
+#  - INCLUDE/LIB 给 cl.exe 设置 VS Build Tools 2019 + Windows 10 SDK 头文件/库路径
+[build]
+rustc = "C:\\Users\\Er\\.rustup\\toolchains\\stable-x86_64-pc-windows-msvc\\bin\\rustc.exe"
+target = "x86_64-pc-windows-msvc"
+
+[env]
+INCLUDE = "C:\\Program Files (x86)\\Windows Kits\\10\\Include\\10.0.19041.0\\ucrt;C:\\Program Files (x86)\\Windows Kits\\10\\Include\\10.0.19041.0\\shared;C:\\Program Files (x86)\\Windows Kits\\10\\Include\\10.0.19041.0\\um;C:\\Program Files (x86)\\Windows Kits\\10\\Include\\10.0.19041.0\\winrt;C:\\Program Files (x86)\\Microsoft Visual Studio\\2019\\BuildTools\\VC\\Tools\\MSVC\\14.29.30133\\include"
+LIB = "C:\\Program Files (x86)\\Windows Kits\\10\\Lib\\10.0.19041.0\\ucrt\\x64;C:\\Program Files (x86)\\Windows Kits\\10\\Lib\\10.0.19041.0\\um\\x64;C:\\Program Files (x86)\\Microsoft Visual Studio\\2019\\BuildTools\\VC\\Tools\\MSVC\\14.29.30133\\lib\\x64"

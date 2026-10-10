@@ -1,0 +1,44 @@
+# 依赖
+node_modules/
+src-tauri/target/
+
+# 构建产物
+dist/
+src-tauri/gen/
+
+# 系统
+.DS_Store
+Thumbs.db
+
+# 编辑器
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# TypeScript 构建缓存
+*.tsbuildinfo
+tsconfig.tsbuildinfo
+
+# 日志
+*.log
+npm-debug.log*
+pnpm-debug.log*
+tauri-dev*.log
+
+# 环境
+.env
+.env.local
+
+# Tauri
+src-tauri/Cargo.lock
+src-tauri/WixTools/
+
+# 调试痕迹（脚本/日志/临时工程）
+.qoder-*
+.cargo-check.log
+.qoder-spawn-test/
+
+# WebView2 运行时数据目录
+.app-data/
+.webview2-userdata/

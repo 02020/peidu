@@ -1,0 +1,73 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "陪读",
+  "version": "0.1.0",
+  "identifier": "com.architect.peidu",
+  "build": {
+    "beforeDevCommand": "pnpm dev",
+    "devUrl": "http://localhost:1420",
+    "beforeBuildCommand": "pnpm build",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "appDirectoriesOverride": "D:/architect/20_tech/reading/peidu/.app-data",
+    "windows": [
+      {
+        "title": "陪读",
+        "width": 1080,
+        "height": 720,
+        "minWidth": 640,
+        "minHeight": 480,
+        "center": true,
+        "dragDropEnabled": true,
+        "resizable": true
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self'; img-src 'self' asset: http://asset.localhost data:; style-src 'self' 'unsafe-inline'; script-src 'self'",
+      "assetProtocol": {
+        "enable": true,
+        "scope": [
+          "**/*.png",
+          "**/*.jpg",
+          "**/*.jpeg",
+          "**/*.gif",
+          "**/*.webp",
+          "**/*.svg"
+        ]
+      }
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ],
+    "fileAssociations": [
+      {
+        "ext": ["md", "markdown", "txt"],
+        "name": "Markdown 陪读文档",
+        "description": "Markdown 文档",
+        "role": "Viewer"
+      },
+      {
+        "ext": ["doc", "docx"],
+        "name": "Word 陪读文档",
+        "description": "Word 文档（预留扩展）",
+        "role": "Viewer"
+      }
+    ]
+  },
+  "plugins": {
+    "deep-link": {
+      "desktop": {
+        "schemes": ["peidu"]
+      }
+    }
+  }
+}
