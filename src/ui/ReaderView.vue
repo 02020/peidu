@@ -3,7 +3,7 @@ import { ref, computed, onMounted, onUnmounted, watch, nextTick } from 'vue';
 import { getCurrentWindow } from '@tauri-apps/api/window';
 import { listen } from '@tauri-apps/api/event';
 import { lexToSegments, type Segment } from '@core/segmenter';
-import { fitSeg, type PageCut, type CutAlgorithm } from '@core/fitSeg';
+import { fitSeg, renderPiece, type PagePiece } from '@core/fitSeg';
 import { makeAnchor } from '@core/anchor';
 import { readDocument, resolveRelative, dirOf, fileSrc, pickFile } from '@platform/fs';
 import { rewriteImages } from '@core/segmenter';
@@ -45,22 +45,33 @@ const fullscreenLabel = computed(() => (isFullscreen.value ? '退出全屏' : '�
 const fingerprint = ref('');
 const notes = ref<NotesDoc>({ version: 1, fingerprint: '', highlights: [] });
 
-// T1: 字号跟视口走 — 直接读 --read-fs (CSS 算好了, 1.8vmin / 2.6vw)
-const fitBase = computed(() => {
-  return parseFloat(getComputedStyle(document.documentElement).getPropertyValue('--read-fs')) || 22;
-});
-const isBigMode = computed(() => document.documentElement.classList.contains('big'));
+// T1: 字号跟视口走 — 读 body 解析后的实际 px (clamp 字符串 parseFloat 会得 NaN)
+//     html 固定 16px (rem 基准), 阅读字号在 body: var(--read-fs)
+const fitBase = computed(() => parseFloat(getComputedStyle(document.body).fontSize) || 22);
+
+// v2: .big 切换 / 窗口尺寸变化会改 --read-fs, getComputedStyle 非响应式 — 用 tick 驱动重算
+const fsTick = ref(0);
+let fsObserver: MutationObserver | null = null;
+function bumpFsTick() {
+  fsTick.value++;
+}
 
 const pages = computed(() => {
   if (!segs.value.length) return [];
-  // 回滚 22px 间距: article px-2 py-2 (8px) → avail - 16
+  // 依赖 --read-fs 变化信号 (全屏 .big / 尺寸变化)
+  void fsTick.value;
+  // 左右各 22px (article px-[22px]) → vw - 44; 上下各 8px (py-2) → avail - 16
   const avail = (articleHeight.value || (window.innerHeight - 60)) - 16;
   if (avail <= 0) return [];
+  const cs = getComputedStyle(document.documentElement);
+  const vw = Math.max(1, (articleRef.value?.clientWidth || window.innerWidth) - 44);
   const result = fitSeg(segs.value as Segment[], {
     viewportHeight: avail,
-    viewportWidth: articleRef.value?.clientWidth || window.innerWidth,
+    viewportWidth: vw,
     fontSizePx: fitBase.value,
-    isBigMode: isBigMode.value,
+    lineHeightRatio: parseFloat(cs.getPropertyValue('--line-h')) || 1.7,
+    gapPx: 16,
+    maxPieceEm: 480,
   });
   return result.pages;
 });
@@ -71,8 +82,7 @@ const currentPage = computed(() => pages.value[pageIdx.value]);
 // P7: 当前页的段号数组 (扁平) — 模板用
 const currentPageSegs = computed(() => currentPage.value?.segIndexes ?? []);
 
-// 字号由 PageCut.fontSize 决定 (fitSeg 算好, 每页独立)
-// 不要固定 — 短段放大, 长段压回, 满屏
+// v2: 字号恒定 (跟 --read-fs), PageCut.fontSize 仅供 debug 显示
 const currentFs = computed(() => currentPage.value?.fontSize ?? fitBase.value);
 
 // P7: 当前页算法 — debug
@@ -489,6 +499,10 @@ onMounted(() => {
   autoFullscreenForPortrait();
   // T2: 监听窗口尺寸变化 — 变成竖屏就全屏, 横屏不动
   window.addEventListener('resize', onOrientationChange);
+  // v2: .big 切换 (syncBigClass 改 html class) / 尺寸变化 → 重算分页
+  fsObserver = new MutationObserver(bumpFsTick);
+  fsObserver.observe(document.documentElement, { attributes: true, attributeFilter: ['class'] });
+  window.addEventListener('resize', bumpFsTick);
   // T4: 剪贴板陪读 — 1.5s 轮询
   const clipTimer = window.setInterval(pollClipboard, 1500);
   onUnmounted(() => clearInterval(clipTimer));
@@ -497,36 +511,22 @@ onUnmounted(() => {
   window.removeEventListener('keydown', onKeydown, { capture: true });
   window.removeEventListener('mouseup', onArticleMouseUp);
   window.removeEventListener('resize', onOrientationChange);
+  window.removeEventListener('resize', bumpFsTick);
+  fsObserver?.disconnect();
+  fsObserver = null;
   // T2: 离开阅读屏 — 还原全屏状态
   restoreBigState().catch(() => {});
 });
 
-function renderSeg(s: Segment): string {
-  // P2 后 raw 已是渲染好的 HTML（marked.parser 已在 segmenter.ts 中调用）
-  // D3: 相对图片重写
-  const base = dirOf(props.path);
-  let html = rewriteImages(s.raw, base, fileSrc);
-  // T1: 不再加整段 hl-pink 类 — 精确包裹在 v-html 渲染后由 wrapSegmentHighlights 处理
-  // 保留 data-seg-idx 供 h 键定位段号 + 右键菜单定位
-  return `<div data-seg-idx="${s.index}">${html}</div>`;
-}
-
 /**
- * P7: 渲染 PageSlice — 支持 [start, end] 切片.
- * - start=0, end=text.length: 完整段 → renderSeg
- * - 否则: 截取 raw 的切片, 用 marked parser 重新渲染
+ * P7 v2: 按 PagePiece [from, to] 渲染 (md 偏移, token 级切割).
+ * D3: 相对图片重写; data-seg-idx 供 h 键 / 右键菜单 / 高亮包裹定位.
  */
-import { marked } from 'marked';
-function renderSlice(slice: { segIdx: number; start: number; end: number }): string {
-  const seg = segs.value[slice.segIdx];
+function renderPieceWithImages(p: PagePiece): string {
+  const seg = segs.value[p.segIdx];
   if (!seg) return '';
-  if (slice.start === 0 && slice.end >= seg.text.length) {
-    return renderSeg(seg);
-  }
-  // 切片: 截取原文 + 重渲
-  const sub = seg.text.slice(slice.start, slice.end);
-  if (!sub.trim()) return '';
-  const html = marked.parse(sub, { async: false }) as string;
+  const html = renderPiece(seg, p);
+  if (!html) return '';
   const base = dirOf(props.path);
   return `<div data-seg-idx="${seg.index}">${rewriteImages(html, base, fileSrc)}</div>`;
 }
@@ -880,11 +880,11 @@ function onArticleClick(e: MouseEvent) {
       </div>
     </div>
 
-    <!-- P3: 一段一屏 + fitSeg 缩字号填屏 -->
+    <!-- P3: 一段一屏 + fitSeg 纯切割分页 -->
     <article
       v-else
       ref="articleRef"
-      class="flex-1 overflow-hidden px-2 py-2"
+      class="flex-1 overflow-hidden px-[22px] py-2"
       @click="onArticleClick"
       @contextmenu.prevent="onContextMenu($event)"
     >
@@ -892,22 +892,21 @@ function onArticleClick(e: MouseEvent) {
       <div
         ref="segRef"
         class="h-full overflow-hidden px-0 py-0 seg-single flex flex-col items-start justify-start gap-[16px]"
-        :style="{ fontSize: currentFs + 'px' }"
       >
         <!-- 续页标题 (split 多页时显示) -->
         <div v-if="currentContinuationTitle" class="text-pd-dim text-[12px] mb-2 italic">
           《{{ currentContinuationTitle }}》
         </div>
         <div
-          v-for="(slice, i) in (currentPage?.slices ?? [])"
-          :key="`${pageIdx}-${slice.segIdx}-${slice.start}`"
+          v-for="(piece, i) in (currentPage?.pieces ?? [])"
+          :key="`${pageIdx}-${piece.segIdx}-${piece.from}`"
           :class="i > 0 ? 'mt-4' : ''"
-          :data-seg-idx="slice.segIdx"
-          v-html="renderSlice(slice)"
+          :data-seg-idx="piece.segIdx"
+          v-html="renderPieceWithImages(piece)"
         />
         <!-- 算法标识 (debug) -->
         <div class="fixed bottom-2 right-2 text-[10px] text-pd-dim opacity-50 select-none pointer-events-none">
-          algo: {{ currentPageAlgo }} · {{ currentPageSegs.length }} 段/页 · {{ Math.round(currentFs) }}px
+          algo: {{ currentPageAlgo }} · {{ currentPage?.pieces.length ?? 0 }} 片/页 · {{ Math.round(currentFs) }}px
         </div>
       </div>
     </article>

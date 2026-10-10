@@ -1,53 +1,55 @@
-// core/fitSeg.ts
-// 按内容切割引擎 — 字号固定, 不缩
-//
-// 规则 (按你最终拍板):
-//   1. 字号固定 = base (CSS --read-fs, 全屏最小 36, 窗口最小 22)
-//   2. 目标字数: target = ⌊avail/lineH⌋ × cpl — 一屏装满的字数
-//   3. 标题切分: H1 永远独占, H2/H3 看上下文 (短共, 长独, 同级共)
-//   4. code/table 永远独占
-//   5. 单段: 装得下 → single-display, 装不下 → split-by-line/block (按句号切, 不缩)
-//   6. 多段: 累加字数 ≤ target × 0.92 就共页, 超就开新页
-//   7. 短段 (≤ 50 字): 强制接下几段, 拼接到接近 target
-//   8. 不缩字号! 段装不下就切多页
-//   9. 短段独立 ≤ 50 字 + 不强制拼 (被前一段挤出去) → 允许上下空白
+/**
+ * fitSeg v2 — 纯切割分页引擎（切割优先于缩字号）
+ *
+ * 规则（优先级从上到下）:
+ * 1. 一段一屏: 每个 Segment 从新页开始, 不与其它段共页
+ * 2. 切割优先于缩字号: 字号跟屏幕走 (--read-fs, CSS 决定), 放不下就切
+ * 3. 长段切多页: 段落按句界切割 (单步碎片 ≤ maxPieceEm 等效字, 默认 480);
+ *    表格/代码/列表/引用按渲染行预算切, 表格续片自动补表头(表头+分隔线)
+ * 4. 短段不强接: 装不满就留白 (内容顶部对齐)
+ * 5. 标题(heading)不孤悬: 页尾放不下 [标题+2行] 时整块翻页; 空页强放防死循环
+ *
+ * 坐标系: piece.from/to 是段内 md 偏移 (tokens 逐 raw 前缀和, 与 tokSpans 一致),
+ *        渲染一律走 renderPiece(seg, piece) — v1 的 seg.text 切法已废弃
+ *
+ * 480 语义: 「段落按字数切割的单步碎片上限」而非整页上限 (等效字: 1 中文字 ≈ 1,
+ *          英文字符 ≈ 0.5; 小屏因行预算自然更小)。一行常量 maxPieceEm 可调。
+ */
+import { marked } from 'marked';
 
-export interface FitSegOptions {
-  /** 视口高度 (像素) */
-  viewportHeight: number;
-  /** 视口宽度 (像素) — 备用 */
-  viewportWidth?: number;
-  /** 字号像素 (固定) */
-  fontSizePx: number;
-  /** 是否全屏模式 (仅 debug) */
-  isBigMode?: boolean;
-  /** 段间距像素 (默认 fontSizePx * 0.5) */
-  gapPx?: number;
+export interface FitSegment {
+  kind?: string;
+  title?: string;
+  text?: string;
+  raw: string;
+  tokens: any[];
 }
 
-export type CutAlgorithm =
-  | 'dense-pack'
-  | 'merged-tiny'
-  | 'title-break'
-  | 'single-display'
-  | 'split-by-line'
-  | 'split-by-block'
-  | 'code-block'
-  | 'table-block';
+export interface FitSegOptions {
+  viewportHeight: number;
+  viewportWidth?: number;
+  fontSizePx: number;
+  lineHeightRatio?: number;
+  gapPx?: number;
+  maxPieceEm?: number;
+}
 
-export interface PageSlice {
+export type CutAlgorithm = 'single' | 'split-para' | 'split-code' | 'split-table' | 'split-list';
+export type PieceFragment = 'md' | 'code' | 'table' | 'list' | 'blockquote' | 'html';
+
+export interface PagePiece {
   segIdx: number;
-  start: number;
-  end: number;
+  from: number;
+  to: number;
+  frag: PieceFragment;
 }
 
 export interface PageCut {
   segIndexes: number[];
-  slices: PageSlice[];
+  pieces: PagePiece[];
   algorithm: CutAlgorithm;
   estimatedHeight: number;
   fillRatio: number;
-  /** 字号 (固定 = base) */
   fontSize: number;
   isContinuation?: boolean;
   continuationTitle?: string;
@@ -58,453 +60,392 @@ export interface FitResult {
   pageCount: number;
 }
 
-// ---------- 阈值 ----------
+const DEF_LINE_RATIO = 1.7;
+const DEF_GAP_PX = 16;
+const DEF_MAX_PIECE_EM = 480;
+const CONT_TITLE_H = 44; // 续页顶部标题栏占高
+const HEAD_TAIL_LINES = 2; // 标题后至少跟随行数（防孤悬）
 
-const FILL_DENSE = 0.92;     // dense-pack 装到 92% 算满
-const FILL_TINY = 1.05;      // merged-tiny 装到 1.05
-const GAP_RATIO = 0.5;
-const SHORT_SEG_LEN = 50;    // 短段 ≤50 字, 强制拼接
-const VERY_LONG_SEG_LEN = 2000;
+/* ============ 等效字测量 ============ */
 
-// ---------- 工具 ----------
-
-function charsPerLineAt(fontSize: number): number {
-  return Math.max(15, 30 + (fontSize - 18) * 1.2);
+function charEm(cp: number, mono: boolean): number {
+  if (cp >= 0x2e80) return 1;
+  if (cp === 0x20 || cp === 0x09) return mono ? 0.62 : 0.32;
+  if (cp < 0x80) return mono ? 0.62 : 0.5;
+  return 1;
 }
 
-function segHeight(text: string, fontSize: number, lineH: number, gap: number, cpl: number): number {
-  const lines = Math.max(1, Math.ceil(text.length / cpl));
-  return lines * lineH + gap;
+export function measureEm(text: string, mono = false): number {
+  let em = 0;
+  for (const ch of text) em += charEm(ch.codePointAt(0)!, mono);
+  return em;
 }
 
-function isTitleKind(k: any): boolean {
-  return k === 'h1' || k === 'h2' || k === 'h3';
+interface Metrics {
+  fs: number;
+  lineH: number;
+  emPerLine: number;
+  capH: number;
+  gap: number;
+  maxEm: number;
 }
 
-function titleMustBreak(kind: any, nextKind: any, nextLen: number): boolean {
-  if (kind === 'h1') return true;
-  if (kind !== 'h2' && kind !== 'h3') return false;
-  if (nextKind === kind) return false;
-  if (nextKind !== undefined && nextKind !== null) {
-    if (isTitleKind(nextKind) === false && nextLen <= SHORT_SEG_LEN * 4) return false;  // 短内容(<200字)共
-  } else {
-    return false;  // 无后续段
-  }
-  return true;
-}
-
-function splitBySentence(text: string, target: number): { left: string; right: string } {
-  if (text.length <= target) return { left: text, right: '' };
-  const puncts = ['。', '！', '?', '?', '!', '.\n', '!\n', '?\n', '\n\n'];
-  let best = -1;
-  for (const p of puncts) {
-    let from = 0;
-    while (true) {
-      const idx = text.indexOf(p, from);
-      if (idx < 0) break;
-      if (idx > best && idx >= Math.floor(target * 0.5) && idx <= Math.floor(target * 1.3)) {
-        best = idx + p.length;
-      }
-      from = idx + p.length;
-    }
-  }
-  if (best <= 0) best = target;
-  return { left: text.slice(0, best), right: text.slice(best) };
-}
-
-function splitByBlock(text: string, target: number): { left: string; right: string } {
-  if (text.length <= target) return { left: text, right: '' };
-  const breaks = ['\n\n', '```\n', '---\n'];
-  let best = -1;
-  for (const p of breaks) {
-    let from = 0;
-    while (true) {
-      const idx = text.indexOf(p, from);
-      if (idx < 0) break;
-      if (idx > best && idx >= Math.floor(target * 0.5) && idx <= Math.floor(target * 1.3)) {
-        best = idx + p.length;
-      }
-      from = idx + p.length;
-    }
-  }
-  if (best <= 0) best = target;
-  return { left: text.slice(0, best), right: text.slice(best) };
-}
-
-function targetChars(avail: number, fontSize: number, lineH: number, cpl: number): number {
-  const linesPerPage = Math.floor(avail / lineH);
-  return Math.max(80, linesPerPage * cpl);
-}
-
-function segHeightTotal<T extends { text: string }>(
-  segs: T[],
-  indices: number[],
-  fs: number,
-  lineH: number,
-  gap: number,
-  cpl: number,
-): number {
-  let total = 0;
-  for (let i = 0; i < indices.length; i++) {
-    total += segHeight(segs[indices[i]!]!.text, fs, lineH, gap, cpl);
-    if (i > 0) total += gap;
-  }
-  return total;
-}
-
-// ---------- 入口 ----------
-
-export function fitSeg<T extends { text: string; kind?: string }>(
-  segments: T[],
-  opts: FitSegOptions,
-): FitResult {
-  const base = opts.fontSizePx;
-  const isBig = !!opts.isBigMode;
-  const lineH = base * 1.7;
-  const gap = opts.gapPx ?? base * GAP_RATIO;
-  const cpl = charsPerLineAt(base);
-  const avail = opts.viewportHeight;
-  const target = targetChars(avail, base, lineH, cpl);
-
-  if (segments.length === 0 || avail <= 0) {
-    return { pages: [], pageCount: 0 };
-  }
-
-  const pages: PageCut[] = [];
-  let buf: number[] = [];
-  const flushBuf = () => {
-    if (buf.length === 0) return;
-    const cuts = dispatchPack(segments, buf, avail, base, lineH, gap, cpl, target);
-    pages.push(...cuts);
-    buf = [];
+function mkMetrics(o: FitSegOptions): Metrics {
+  const fs = o.fontSizePx > 0 ? o.fontSizePx : 22;
+  const ratio = o.lineHeightRatio && o.lineHeightRatio > 0 ? o.lineHeightRatio : DEF_LINE_RATIO;
+  const vw = o.viewportWidth && o.viewportWidth > 0 ? o.viewportWidth : fs * 30;
+  const vh = o.viewportHeight > 0 ? o.viewportHeight : fs * 30;
+  const lineH = fs * ratio;
+  return {
+    fs,
+    lineH,
+    emPerLine: Math.max(1, Math.floor(vw / fs)),
+    capH: Math.max(lineH, Math.floor(vh / lineH) * lineH),
+    gap: o.gapPx != null && o.gapPx >= 0 ? o.gapPx : DEF_GAP_PX,
+    maxEm: o.maxPieceEm && o.maxPieceEm > 0 ? o.maxPieceEm : DEF_MAX_PIECE_EM,
   };
-  for (let i = 0; i < segments.length; i++) {
-    const seg = segments[i]!;
-    if (isTitleKind(seg.kind)) {
-      const next = i + 1 < segments.length ? segments[i + 1]! : null;
-      const nextKind = next?.kind ?? null;
-      const nextLen = next?.text.length ?? 0;
-      if (titleMustBreak(seg.kind, nextKind, nextLen)) {
-        flushBuf();
-        pages.push(makePageCut([i], segments, 0, seg.text.length, 'title-break', avail, base, lineH, gap, cpl, isBig));
-      } else {
-        buf.push(i);
-      }
-    } else if (seg.kind === 'code' || seg.kind === 'table') {
-      flushBuf();
-      const algo: 'code-block' | 'table-block' = seg.kind === 'code' ? 'code-block' : 'table-block';
-      pages.push(makePageCut([i], segments, 0, seg.text.length, algo, avail, base, lineH, gap, cpl, isBig));
-    } else {
-      buf.push(i);
+}
+
+function linesOf(em: number, m: Metrics): number {
+  return Math.max(1, Math.ceil(em / m.emPerLine - 1e-6));
+}
+
+/** 续页顶部有《标题 · N》栏, 可容纳行数按行量化后减掉 */
+function capOf(m: Metrics, segPage: number): number {
+  if (segPage <= 0) return m.capH;
+  return Math.max(m.lineH, Math.floor((m.capH - CONT_TITLE_H) / m.lineH) * m.lineH);
+}
+
+/* ============ token 片段与 span ============ */
+
+interface TokSpan {
+  tok: any;
+  start: number;
+  end: number;
+}
+
+function tokFrag(tok: any): PieceFragment {
+  switch (tok.type) {
+    case 'code':
+      return 'code';
+    case 'table':
+      return 'table';
+    case 'list':
+      return 'list';
+    case 'blockquote':
+      return 'blockquote';
+    case 'html':
+      return 'html';
+    default:
+      return 'md';
+  }
+}
+
+function isHidden(tok: any): boolean {
+  return tok.type === 'space' || tok.type === 'def';
+}
+
+function isAtomic(tok: any): boolean {
+  return tok.type === 'heading' || tok.type === 'html' || tok.type === 'hr';
+}
+
+function isMono(f: PieceFragment): boolean {
+  return f === 'code';
+}
+
+function tokSpans(seg: FitSegment): TokSpan[] {
+  const out: TokSpan[] = [];
+  let off = 0;
+  for (const t of seg.tokens || []) {
+    if (isHidden(t)) continue;
+    const raw = typeof t.raw === 'string' ? t.raw : '';
+    if (!raw) continue;
+    out.push({ tok: t, start: off, end: off + raw.length });
+    off += raw.length;
+  }
+  return out;
+}
+
+function mdOf(spans: TokSpan[]): string {
+  return spans.map((s) => s.tok.raw as string).join('');
+}
+
+function locateSp(spans: TokSpan[], cur: number): TokSpan | null {
+  for (const sp of spans) if (sp.end > cur) return sp;
+  return null;
+}
+
+/* ============ 片高估算 (px) ============ */
+
+function srcLines(s: string): number {
+  const t = s.replace(/\n+$/, '');
+  return t === '' ? 0 : t.split('\n').length;
+}
+
+/**
+ * 表格/代码/列表/引用逐行渲染 (每源行至少占 1 渲染行), 段落按等效字折算行数
+ */
+function pieceHeight(slice: string, frag: PieceFragment, m: Metrics): number {
+  const wl = linesOf(measureEm(slice, isMono(frag)), m);
+  const lines = frag === 'md' || frag === 'html' ? wl : Math.max(srcLines(slice), wl);
+  return lines * m.lineH;
+}
+
+/* ============ 切割器 ============ */
+
+/** 句界: 中文句末标点 / 换行 / 英文句点(后跟空格或结尾) */
+const SENT_RE = /[。！？；!?;…][）」』】]*|\n|\.(?=\s|$|\u0001)/g;
+
+/**
+ * 段落按句界切割; 单步碎片 ≤ min(limitEm, maxEm=480).
+ * 窗口扫描: 句界累积超过 hardEm 即停; 至少累积到 0.4×hardEm 才允许落点;
+ * 无句界兜底延迟按字符硬切 (超长无标点文本).
+ */
+function cutPara(md: string, start: number, end: number, limitEm: number, m: Metrics): number {
+  const hardEm = Math.min(limitEm, m.maxEm);
+  const scanLen = Math.min(end - start, Math.ceil(hardEm * 3.2) + 64);
+  const win = md.slice(start, start + scanLen) + '\u0001';
+  let best = -1;
+  let acc = 0;
+  let pos = 0;
+  SENT_RE.lastIndex = 0;
+  let mt: RegExpExecArray | null;
+  while ((mt = SENT_RE.exec(win))) {
+    const endPos = mt.index + mt[0].length;
+    acc += measureEm(win.slice(pos, endPos));
+    pos = endPos;
+    if (acc > hardEm) break;
+    const cut = start + pos;
+    if (cut >= end) {
+      best = end;
+      break;
+    }
+    if (acc >= hardEm * 0.4) best = cut;
+  }
+  if (best > start) return Math.min(best, end);
+  // 无句界兜底: 按字符硬切到 hardEm
+  let off = 0;
+  let em = 0;
+  for (const ch of win) {
+    const e = charEm(ch.codePointAt(0)!, false);
+    if (em + e > hardEm + 1e-6) break;
+    em += e;
+    off += ch.length;
+  }
+  return off > 0 ? Math.min(start + off, end) : Math.min(start + 1, end);
+}
+
+/** 顶层列表项: 行首缩进 0 的项目符号 (- + *) 或有序号 (1. / 1)) */
+const ITEM_RE = /^[ \t]*([-*+]|\d{1,9}[.)])([ \t]|$)/;
+
+function indentOf(s: string): number {
+  return (s.match(/^[ \t]*/) || [''])[0].length;
+}
+
+/**
+ * 表格/代码/列表/引用按渲染行预算切 (表格行会因列宽折行, 用 em 折算修正).
+ * preferItem: 列表切点回退到「下一行是顶层项」的边界 (不切开子项).
+ * minLines: 表格首批至少 [表头+分隔线] 2 行; 单行超长时整行放入允许溢出.
+ */
+function cutByLines(
+  raw: string,
+  start: number,
+  end: number,
+  maxLines: number,
+  mono: boolean,
+  preferItem: boolean,
+  minLines: number,
+  m: Metrics,
+): number {
+  const starts: number[] = [start];
+  for (let i = start; i < end; i++) {
+    if (raw[i] === '\n' && i + 1 < end) starts.push(i + 1);
+  }
+  const lineEnd = (k: number): number => (k + 1 < starts.length ? starts[k + 1] : end);
+  let acc = 0;
+  let capLines = 0;
+  for (let k = 0; k < starts.length; k++) {
+    const em = measureEm(raw.slice(starts[k], lineEnd(k)).replace(/\n+$/, ''), mono);
+    const ll = Math.max(1, Math.ceil(em / m.emPerLine - 1e-6));
+    if (k > 0 && acc + ll > maxLines) break;
+    acc += ll;
+    capLines = k + 1;
+    if (lineEnd(k) >= end) break;
+  }
+  if (capLines < minLines) return lineEnd(Math.min(minLines, starts.length) - 1); // 宁可小幅溢出也要保住 [表头+分隔线]
+  const last = lineEnd(capLines - 1);
+  if (last >= end) return end;
+  if (preferItem) {
+    for (let k = capLines - 1; k >= minLines - 1; k--) {
+      const le = lineEnd(k);
+      const next = raw.slice(le);
+      if (ITEM_RE.test(next) && indentOf(next) === 0) return le;
     }
   }
-  flushBuf();
+  return last;
+}
+
+function algoOf(f: PieceFragment): CutAlgorithm {
+  if (f === 'code') return 'split-code';
+  if (f === 'table') return 'split-table';
+  if (f === 'list') return 'split-list';
+  return 'split-para';
+}
+
+/** 在 token 内切一刀, 返回段内 md 偏移 */
+function cutFrag(sp: TokSpan, md: string, cursor: number, room: number, m: Metrics): number {
+  const raw = sp.tok.raw as string;
+  const frag = tokFrag(sp.tok);
+  const lines = Math.max(1, Math.floor(room / m.lineH + 1e-6));
+  const local = cursor - sp.start;
+  if (frag === 'code') return sp.start + cutByLines(raw, local, raw.length, lines, true, false, 1, m);
+  if (frag === 'table') {
+    const first = local === 0;
+    const bud = first && lines < 2 ? 2 : lines;
+    return sp.start + cutByLines(raw, local, raw.length, bud, false, false, first ? 2 : 1, m);
+  }
+  if (frag === 'list') return sp.start + cutByLines(raw, local, raw.length, lines, false, true, 1, m);
+  if (frag === 'blockquote') return sp.start + cutByLines(raw, local, raw.length, lines, false, false, 1, m);
+  return cutPara(md, cursor, sp.end, lines * m.emPerLine, m);
+}
+
+/* ============ 主板: 一段一屏 → 页内打包/切割 ============ */
+
+export function fitSeg(segments: FitSegment[], opts: FitSegOptions): FitResult {
+  const m = mkMetrics(opts);
+  const pages: PageCut[] = [];
+
+  for (let si = 0; si < segments.length; si++) {
+    const seg = segments[si];
+    const spans = tokSpans(seg);
+    if (spans.length === 0) continue;
+    const contentLen = spans[spans.length - 1].end;
+    const md = mdOf(spans);
+    const title = String(seg.title || seg.text || '续').slice(0, 24) || '续';
+
+    // fast path: 整段 (token 间无 gap — preflight margin=0) 一屏装得下
+    let wholeH = 0;
+    for (const sp of spans) wholeH += pieceHeight(sp.tok.raw as string, tokFrag(sp.tok), m);
+    if (wholeH <= m.capH + 1e-6) {
+      pages.push({
+        segIndexes: [si],
+        pieces: [{ segIdx: si, from: 0, to: contentLen, frag: 'md' }],
+        algorithm: 'single',
+        estimatedHeight: wholeH,
+        fillRatio: Math.min(1, wholeH / m.capH),
+        fontSize: m.fs,
+      });
+      continue;
+    }
+
+    let cursor = 0;
+    let segPage = 0;
+    while (cursor < contentLen) {
+      const cap = capOf(m, segPage);
+      const pieces: PagePiece[] = [];
+      let usedH = 0;
+      while (cursor < contentLen) {
+        const sp = locateSp(spans, cursor);
+        if (!sp) {
+          cursor = contentLen;
+          break;
+        }
+        const raw = sp.tok.raw as string;
+        const frag = tokFrag(sp.tok);
+        const gap = pieces.length > 0 ? m.gap : 0;
+        const room = cap - usedH - gap;
+        let to = sp.end;
+        if (isAtomic(sp.tok)) {
+          const h = pieceHeight(raw, frag, m);
+          // 标题不孤悬: 页尾放不下 [标题+2行] 就翻页; 空页强放防死循环
+          if (pieces.length > 0 && room < h + m.gap + HEAD_TAIL_LINES * m.lineH) break;
+        } else {
+          const tokH = pieceHeight(raw, frag, m);
+          if (tokH > room + 1e-6) {
+            if (room < m.lineH) break;
+            const cut = cutFrag(sp, md, cursor, room, m);
+            to = Math.max(cursor + 1, Math.min(cut, sp.end));
+          }
+        }
+        const slice = md.slice(cursor, to);
+        pieces.push({ segIdx: si, from: cursor, to, frag });
+        usedH += gap + pieceHeight(slice, frag, m);
+        cursor = to;
+      }
+      if (pieces.length === 0) break;
+      const single = pieces.length === 1 && pieces[0].from === 0 && pieces[0].to >= contentLen;
+      pages.push({
+        segIndexes: [si],
+        pieces,
+        algorithm: single ? 'single' : algoOf(pieces[0].frag),
+        estimatedHeight: Math.min(usedH, cap),
+        fillRatio: Math.min(1, usedH / cap),
+        fontSize: m.fs,
+        ...(segPage > 0 ? { isContinuation: true, continuationTitle: `${title} · ${segPage + 1}` } : {}),
+      });
+      segPage++;
+    }
+  }
 
   return { pages, pageCount: pages.length };
 }
 
-// ---------- 缩字号 (web 版 §6.4) ----------
+/* ============ 渲染 ============ */
 
-const FILL_LOW = 0.85;
-const FILL_HIGH = 1.02;
-const TARGET_FILL_LOW = 0.90;
-const TARGET_FILL_HIGH = 0.97;
-const ABSOLUTE_MIN_FS_BIG = 36;
-const ABSOLUTE_MIN_FS_WINDOW = 22;
-const MAX_FS_RATIO = 2.5;
-const MIN_FS_RATIO = 0.7;
-const MAX_PASS = 3;
-const CONVERGE_PX = 0.5;
-
-/**
- * sqrt 缩字号填满 — 每页独立, 按内容切之后做
- *
- * @param textLength 段总字符数 (多段累加)
- * @param avail 可用视口高
- * @param base 基准字号
- * @param isBig 全屏模式
- */
-function shrinkToFill(
-  textLength: number,
-  avail: number,
-  base: number,
-  isBig: boolean,
-): { fs: number; height: number; fill: number } {
-  const absoluteMin = isBig ? ABSOLUTE_MIN_FS_BIG : ABSOLUTE_MIN_FS_WINDOW;
-  const lo = Math.max(absoluteMin, base * MIN_FS_RATIO);
-  const hi = base * MAX_FS_RATIO;
-  let cur = base;
-  let curLineH = cur * 1.7;
-  let curCpl = charsPerLineAt(cur);
-  let lines = Math.max(1, Math.ceil(textLength / curCpl));
-  let h = lines * curLineH + (textLength > 0 ? cur * GAP_RATIO : 0);
-  for (let pass = 0; pass < MAX_PASS; pass++) {
-    if (h <= 0) break;
-    if (h >= avail * FILL_LOW && h <= avail * FILL_HIGH) break;
-    const want = cur * Math.sqrt(
-      (h < avail * FILL_LOW ? avail * TARGET_FILL_LOW : avail * TARGET_FILL_HIGH) / h,
-    );
-    const clamped = Math.max(lo, Math.min(hi, want));
-    if (Math.abs(clamped - cur) < CONVERGE_PX) { cur = clamped; break; }
-    cur = clamped;
-    // 重新算 h — 字符数不变, 但 cpl / lineH 跟字号走
-    curCpl = charsPerLineAt(cur);
-    curLineH = cur * 1.7;
-    lines = Math.max(1, Math.ceil(textLength / curCpl));
-    h = lines * curLineH + (textLength > 0 ? cur * GAP_RATIO : 0);
-  }
-  return { fs: cur, height: h, fill: h / avail };
-}
-
-// ---------- 单页函数 ----------
-
-function makePageCut<T extends { text: string; kind?: string }>(
-  segIds: number[],
-  segs: T[],
-  start: number,
-  end: number,
-  algo: CutAlgorithm,
-  avail: number,
-  base: number,
-  lineH: number,
-  gap: number,
-  cpl: number,
-  isBig: boolean,
-  isContinuation?: boolean,
-  continuationTitle?: string,
-): PageCut {
-  // 字符数累加 (多段)
-  let textLength = 0;
-  for (let i = 0; i < segIds.length; i++) {
-    const idx = segIds[i]!;
-    if (i === 0) {
-      textLength += end - start;
-    } else {
-      textLength += segs[idx]!.text.length;
-    }
-  }
-  // 缩字号填满 avail — 按内容切之后
-  const { fs, height, fill } = shrinkToFill(textLength, avail, base, isBig);
-  return {
-    segIndexes: segIds,
-    slices: segIds.map((i, idx) => ({
-      segIdx: i,
-      start: idx === 0 ? start : 0,
-      end: idx === 0 ? end : segs[i]!.text.length,
-    })),
-    algorithm: algo,
-    estimatedHeight: height,
-    fillRatio: fill,
-    fontSize: fs,
-    isContinuation,
-    continuationTitle,
-  };
-}
-
-function dispatchPack<T extends { text: string; kind?: string }>(
-  segs: T[],
-  indices: number[],
-  avail: number,
-  base: number,
-  lineH: number,
-  gap: number,
-  cpl: number,
-  target: number,
-): PageCut[] {
-  if (indices.length === 0) return [];
-
-  // 单段
-  if (indices.length === 1) {
-    return splitOrShowOne(segs, indices, avail, base, lineH, gap, cpl, target);
-  }
-
-  // 多段
-  const chars = indices.reduce((s, i) => s + segs[i]!.text.length, 0);
-  const avgChars = chars / indices.length;
-  if (avgChars <= SHORT_SEG_LEN) {
-    return mergedTiny(segs, indices, avail, base, lineH, gap, cpl);
-  }
-  return densePack(segs, indices, avail, base, lineH, gap, cpl, target);
-}
-
-function splitOrShowOne<T extends { text: string; kind?: string }>(
-  segs: T[],
-  indices: number[],
-  avail: number,
-  base: number,
-  lineH: number,
-  gap: number,
-  cpl: number,
-  target: number,
-): PageCut[] {
-  const segIdx = indices[0]!;
-  const seg = segs[segIdx]!;
-  const text = seg.text;
-  const h = segHeight(text, base, lineH, gap, cpl);
-  // 装得下 (1 屏内) — 注意: 不缩字号, 也不强制 0.62-1.02 范围
-  // 单段超 1 屏但 ≤ 1.05×target: 仍单页 (允许段略超, 内容连贯)
-  if (h <= avail * 1.02) {
-    return [makePageCut([segIdx], segs, 0, text.length, 'single-display', avail, base, lineH, gap, cpl, false)];
-  }
-  // 装不下 — 切
-  const veryLong = text.length > VERY_LONG_SEG_LEN;
-  return splitLong(segs, segIdx, avail, base, lineH, gap, cpl, target, veryLong ? 'split-by-block' : 'split-by-line');
-}
-
-function splitLong<T extends { text: string; kind?: string }>(
-  segs: T[],
-  segIdx: number,
-  avail: number,
-  base: number,
-  lineH: number,
-  gap: number,
-  cpl: number,
-  target: number,
-  algo: 'split-by-line' | 'split-by-block',
-): PageCut[] {
-  const seg = segs[segIdx]!;
-  const splitFn = algo === 'split-by-block' ? splitByBlock : splitBySentence;
-  const out: PageCut[] = [];
-  let rest = seg.text;
-  let consumed = 0;
-  const baseTitle = seg.text.slice(0, 20).replace(/\s+/g, ' ').trim() || '续';
-  // 每次切 target 长度
-  while (rest.length > target * 1.02) {
-    const { left, right } = splitFn(rest, target);
-    if (!left || left.length >= rest.length) break;
-    const end = consumed + left.length;
-    out.push(makePageCut([segIdx], segs, consumed, end, algo, avail, base, lineH, gap, cpl, false, consumed > 0, consumed > 0 ? `${baseTitle} · ${out.length + 1}` : undefined));
-    consumed = end;
-    rest = right;
-  }
-  if (rest.length > 0) {
-    out.push(makePageCut([segIdx], segs, consumed, consumed + rest.length, algo, avail, base, lineH, gap, cpl, false, consumed > 0, consumed > 0 ? `${baseTitle} · ${out.length + 1}` : undefined));
-  }
-  return out;
-}
-
-/**
- * dense-pack — 多段共页 (上限 3 段)
- *  - 第一段总是进 cur
- *  - 第 2 段: 超 target × 1.5 → flush; 否则接
- *  - 第 3 段: 超 target × 1.2 → flush; 否则接
- *  - 第 4 段: 强制 flush
- *  - 首段本身 ≤ 50 字 (短段): 单独一页, 不强接, 接受不满
- */
-function densePack<T extends { text: string; kind?: string }>(
-  segs: T[],
-  indices: number[],
-  avail: number,
-  base: number,
-  lineH: number,
-  gap: number,
-  cpl: number,
-  target: number,
-): PageCut[] {
-  const out: PageCut[] = [];
-  let cur: number[] = [];
-  let curChars = 0;
-  const flush = () => {
-    if (cur.length === 0) return;
-    const h = segHeightTotal(segs, cur, base, lineH, gap, cpl);
-    out.push({
-      segIndexes: cur,
-      slices: cur.map((i) => ({ segIdx: i, start: 0, end: segs[i]!.text.length })),
-      algorithm: 'dense-pack',
-      estimatedHeight: h,
-      fillRatio: h / avail,
-      fontSize: base,
-    });
-    cur = []; curChars = 0;
-  };
-  for (const i of indices) {
-    const seg = segs[i]!;
-    const segChars = seg.text.length;
-    if (cur.length === 0) {
-      // 首段进 cur
-      cur.push(i);
-      curChars += segChars;
-      // 首段本身 ≤ 50 字: 单独一页, 不强接
-      if (segChars <= SHORT_SEG_LEN) {
-        flush();
-      }
+/** 按 piece 偏移渲染; 整段直返 seg.raw (fast path 零重排) */
+export function renderPiece(seg: FitSegment, p: PagePiece): string {
+  const spans = tokSpans(seg);
+  if (spans.length === 0) return '';
+  const contentLen = spans[spans.length - 1].end;
+  if (p.from <= 0 && p.to >= contentLen) return seg.raw;
+  const parts: string[] = [];
+  for (const sp of spans) {
+    const raw = sp.tok.raw as string;
+    const a = Math.max(0, p.from - sp.start);
+    const b = Math.min(raw.length, p.to - sp.start);
+    if (b <= a) continue;
+    if (a <= 0 && b >= raw.length) {
+      parts.push(raw);
       continue;
     }
-    // 已有 1+ 段
-    if (cur.length >= 3) {
-      // 第 4 段起: 强制 flush
-      flush();
-    } else if (cur.length === 2) {
-      // 第 3 段: 超 target × 1.2 → flush, 否则接
-      if (curChars + segChars + gap > target * 1.2) flush();
-    } else {
-      // 第 2 段: 超 target × 1.5 → flush, 否则接
-      if (curChars + segChars + gap > target * 1.5) flush();
+    const frag = tokFrag(sp.tok);
+    if (frag === 'html') {
+      parts.push(raw.slice(a, b));
+      continue;
     }
-    cur.push(i);
-    curChars += segChars;
+    parts.push(sliceToken(sp.tok, raw, a, b));
   }
-  flush();
-  return out;
+  const md = parts.join('\n\n');
+  if (p.frag === 'html') return md;
+  return marked.parse(md, { async: false }) as string;
 }
 
-/**
- * merged-tiny — 碎小段多段共页 (装到 1.05x, 但不缩字号, 仅靠短段自然填)
- */
-function mergedTiny<T extends { text: string; kind?: string }>(
-  segs: T[],
-  indices: number[],
-  avail: number,
-  base: number,
-  lineH: number,
-  gap: number,
-  cpl: number,
-): PageCut[] {
-  const out: PageCut[] = [];
-  let cur: number[] = [];
-  let curH = 0;
-  const flush = () => {
-    if (cur.length === 0) return;
-    out.push({
-      segIndexes: cur,
-      slices: cur.map((i) => ({ segIdx: i, start: 0, end: segs[i]!.text.length })),
-      algorithm: 'merged-tiny',
-      estimatedHeight: curH,
-      fillRatio: curH / avail,
-      fontSize: base,
-    });
-    cur = []; curH = 0;
-  };
-  for (const i of indices) {
-    const seg = segs[i]!;
-    const h = segHeight(seg.text, base, lineH, gap, cpl);
-    if (cur.length > 0 && curH + h + gap > avail * FILL_TINY) flush();
-    cur.push(i);
-    curH += h;
+/** 单片 token 的续片修复: 表格补表头 / 代码块补围栏 */
+function sliceToken(tok: any, raw: string, a: number, b: number): string {
+  if (tok.type === 'table' && a > 0) {
+    const body = raw.slice(a, b).replace(/^\n+/, '');
+    let i = 0;
+    let seen = 0;
+    while (i < raw.length && seen < 2) {
+      if (raw[i] === '\n') seen++;
+      i++;
+    }
+    return raw.slice(0, i) + body;
   }
-  flush();
+  if (tok.type === 'code') return repairCode(tok, raw, a, b);
+  return raw.slice(a, b);
+}
+
+function repairCode(tok: any, raw: string, a: number, b: number): string {
+  // marked v12 code token 无 fenced 标记, 只能从 raw 前缀区分围栏/缩进
+  const fm = /^ {0,3}(`{3,}|~{3,})/.exec(raw);
+  if (!fm) {
+    const body = raw.slice(a, b).split('\n').map((l) => l.replace(/^(?: {4}|\t)/, '')).join('\n');
+    return '```\n' + body.replace(/\n+$/, '') + '\n```';
+  }
+  const marker = fm[1]!;
+  const lang = typeof tok.lang === 'string' ? tok.lang.trim().split(/\s+/)[0] || '' : '';
+  let out = (a > 0 ? marker + lang + '\n' : '') + raw.slice(a, b);
+  if (b < raw.length) out = out.replace(/\n+$/, '') + '\n' + marker;
   return out;
-}
-
-// ---------- 兼容 shim ----------
-
-export function measureSeg(s: { text: string }, opts: {
-  fontSizePx: number;
-  lineHeightPx?: number;
-  gapPx?: number;
-  charsPerLine?: number;
-}): number {
-  const fs = opts.fontSizePx;
-  const lineH = opts.lineHeightPx ?? fs * 1.7;
-  const gap = opts.gapPx ?? fs * GAP_RATIO;
-  const cpl = opts.charsPerLine ?? charsPerLineAt(fs);
-  return segHeight(s.text, fs, lineH, gap, cpl);
-}
-
-export function shrinkGrow<T extends { text: string }>(
-  _segments: T[],
-  _pageSegIndexes: number[],
-  baseFontSize: number,
-): number {
-  return baseFontSize;
 }

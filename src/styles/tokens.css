@@ -16,6 +16,7 @@
   }
 }
 
+:root {
   /* T1: 列表项字号 14~32px 区间 */
   --list-fs-min: 14px;
   --list-fs-max: 32px;
@@ -99,7 +100,7 @@ html, body {
 
 /* T1: 全屏 .big 模式 — 字号跟视口走, 最小 36 */
 :where(:root.big) {
-  --read-fs: clamp(36px, 1.8vmin, 56px);
+  --read-fs: clamp(36px, 1.8vmin, 64px);
   --line-h: 1.85;
   --read-gap: 1.8em;
 }
@@ -180,7 +181,7 @@ html, body {
   max-width: 100%;
   min-height: 100%;  /* 短段不满时, 仍占满, 内容顶部对齐 */
   line-height: var(--line-h);
-  /* font-size 由 inline style 实时控制 (currentFs = base, 固定) */
+  /* font-size 继承 body var(--read-fs) — v2 字号恒定, 不再靠 inline style */
   overflow-wrap: normal;
   word-break: normal;
 }
